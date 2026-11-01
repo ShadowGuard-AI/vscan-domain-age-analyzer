@@ -41,6 +41,7 @@ def get_domain_age(domain, use_whois=False):
                 w = whois.whois(domain)
                 if w.creation_date:
                   if isinstance(w.creation_date, list):
+                    # First is not earliest. Registries that report several dates do not promise their order, so picking index zero can take a renewal or transfer stamp and make an old domain look newly registered, which is the exact mistake this tool exists to avoid.
                     creation_date = w.creation_date[0] # Use the first creation date if multiple are present
                   else:
                     creation_date = w.creation_date
@@ -69,6 +70,7 @@ def get_domain_age(domain, use_whois=False):
                 for pre_tag in pre_tags:
                   whois_data = pre_tag.text.strip() #Get text content of <pre> tag
                   if 'Creation Date:' in whois_data:
+                    # My default path, when --whois is not passed, is this scrape of one website's page layout and one date shape. A registry whose record writes the date in ISO form, or a page that changes its markup, gives me nothing, and the failure reads exactly like a domain with no creation date.
                     match = re.search(r"Creation Date:\s*([A-Za-z]{3}-\d{2}-\d{4})", whois_data) #Updated Regex
                     if match:
                         date_str = match.group(1)
@@ -92,6 +94,7 @@ def registered_domain(host):
     host = host.rstrip(".")
     parts = host.split(".")
     if len(parts) >= 2:
+        # Last two labels is a shortcut that breaks on public suffixes: a host under co.uk reduces to co.uk itself, and the age I then look up belongs to the suffix registry, not to the operator's domain.
         return ".".join(parts[-2:])
     return host
 
@@ -149,6 +152,7 @@ def validate_domain(domain):
         bool: True if the domain is valid, False otherwise.
     """
     # A simple regex for basic domain validation.  More complete validation might be needed.
+    # This pattern also accepts names with leading dots, empty labels, and hyphens at the edges, while refusing single letter top level domains and internationalised names. It is a shape check against typos, not a statement that the domain exists.
     if not re.match(r"^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", domain):
         logging.error(f"Invalid domain format: {domain}")
         return False
@@ -186,6 +190,7 @@ def main():
                         print(f"  - {value}")
                     else:
                         reg_domain = registered_domain(value)
+                        # There is no caching on this loop. Several MX or NS hosts usually share one registered domain, and I fetch its age again for each of them, which on the scraping path means repeated requests to the same page for the same answer.
                         creation_date_assoc = get_domain_age(reg_domain, args.whois)
                         if creation_date_assoc:
                           age_assoc = (datetime.date.today() - creation_date_assoc).days

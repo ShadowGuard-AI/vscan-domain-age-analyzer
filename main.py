@@ -5,6 +5,7 @@ from bs4 import BeautifulSoup
 import datetime
 import socket
 import whois
+import dns.resolver
 import re
 import sys
 
@@ -86,47 +87,55 @@ def get_domain_age(domain, use_whois=False):
     return None
 
 
+def registered_domain(host):
+    """Return the registered domain (last two labels) of a host name."""
+    host = host.rstrip(".")
+    parts = host.split(".")
+    if len(parts) >= 2:
+        return ".".join(parts[-2:])
+    return host
+
+
 def get_associated_domains(domain):
     """
-    Retrieves associated domains by performing DNS lookups (A, MX, NS records).
+    Retrieves DNS records for a domain, grouped by record type.
+
+    A records come from address resolution. MX and NS records come from
+    real MX and NS lookups through the resolver.
 
     Args:
         domain (str): The domain to analyze.
 
     Returns:
-        set: A set of associated domains.
+        dict: Mapping of "A", "MX", and "NS" to lists of record values.
+              A values are IP addresses; MX and NS values are host names.
     """
-    associated_domains = set()
+    records = {"A": [], "MX": [], "NS": []}
     try:
-        # A records
+        # A records, from address resolution
         try:
-            a_records = socket.gethostbyname_ex(domain)[2]
-            for ip in a_records:
-                try:
-                    associated_domain = socket.getfqdn(ip)
-                    associated_domains.add(associated_domain)
-                except socket.herror:
-                    pass  # Ignore if reverse DNS lookup fails
+            records["A"] = list(socket.gethostbyname_ex(domain)[2])
         except socket.gaierror:
             logging.warning(f"Could not resolve A records for {domain}")
 
-        # MX records
+        # MX records, from an MX lookup through the resolver
         try:
-            mx_records = socket.getaddrinfo(domain, 25)
-            for mx in mx_records:
-                associated_domains.add(mx[4][0])
-        except socket.gaierror:
+            answers = dns.resolver.resolve(domain, "MX")
+            records["MX"] = sorted({answer.exchange.to_text().rstrip(".") for answer in answers})
+        except Exception:
             logging.warning(f"Could not resolve MX records for {domain}")
 
-        # NS records - requires a separate module or API call for proper resolution.
-        # This example doesn't implement NS record retrieval for simplicity and due to
-        # reliance on external dependencies or APIs.  A more complete implementation
-        # would use dnspython or a similar library.
+        # NS records, from an NS lookup through the resolver
+        try:
+            answers = dns.resolver.resolve(domain, "NS")
+            records["NS"] = sorted({answer.target.to_text().rstrip(".") for answer in answers})
+        except Exception:
+            logging.warning(f"Could not resolve NS records for {domain}")
 
     except Exception as e:
         logging.error(f"Error getting associated domains for {domain}: {e}")
 
-    return associated_domains
+    return records
 
 
 def validate_domain(domain):
@@ -139,7 +148,7 @@ def validate_domain(domain):
     Returns:
         bool: True if the domain is valid, False otherwise.
     """
-    # A simple regex for basic domain validation.  More robust validation might be needed.
+    # A simple regex for basic domain validation.  More complete validation might be needed.
     if not re.match(r"^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", domain):
         logging.error(f"Invalid domain format: {domain}")
         return False
@@ -166,16 +175,23 @@ def main():
         print(f"Could not determine age for domain: {domain}")
 
     if args.dns:
-        associated_domains = get_associated_domains(domain)
-        if associated_domains:
+        records = get_associated_domains(domain)
+        if any(records.values()):
             print("\nAssociated Domains (DNS):")
-            for assoc_domain in associated_domains:
-                creation_date_assoc = get_domain_age(assoc_domain, args.whois)
-                if creation_date_assoc:
-                  age_assoc = (datetime.date.today() - creation_date_assoc).days
-                  print(f"  - {assoc_domain} - Creation Date: {creation_date_assoc}, Age: {age_assoc} days")
-                else:
-                  print(f"  - {assoc_domain} - Could not determine age")
+            for record_type in ("A", "MX", "NS"):
+                print(f"{record_type}:")
+                for value in records[record_type]:
+                    if record_type == "A":
+                        # A values are IP addresses; age lookups run on domain names only.
+                        print(f"  - {value}")
+                    else:
+                        reg_domain = registered_domain(value)
+                        creation_date_assoc = get_domain_age(reg_domain, args.whois)
+                        if creation_date_assoc:
+                          age_assoc = (datetime.date.today() - creation_date_assoc).days
+                          print(f"  - {value} - Registered Domain: {reg_domain} - Creation Date: {creation_date_assoc}, Age: {age_assoc} days")
+                        else:
+                          print(f"  - {value} - Registered Domain: {reg_domain} - Could not determine age")
         else:
             print("No associated domains found.")
 

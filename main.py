@@ -41,8 +41,20 @@ def get_domain_age(domain, use_whois=False):
                 w = whois.whois(domain)
                 if w.creation_date:
                   if isinstance(w.creation_date, list):
-                    # First is not earliest. Registries that report several dates do not promise their order, so picking index zero can take a renewal or transfer stamp and make an old domain look newly registered, which is the exact mistake this tool exists to avoid.
-                    creation_date = w.creation_date[0] # Use the first creation date if multiple are present
+                    # Registries that report several dates do not promise
+                    # their order, so the earliest date is the creation
+                    # date. Picking the first entry can take a renewal or
+                    # transfer stamp and make an old domain look new.
+                    candidates = []
+                    for entry in w.creation_date:
+                        if isinstance(entry, datetime.datetime):
+                            candidates.append(entry.date())
+                        elif isinstance(entry, datetime.date):
+                            candidates.append(entry)
+                    if not candidates:
+                        logging.warning(f"Unexpected date type for {domain}: {type(w.creation_date)}")
+                        return None
+                    creation_date = min(candidates)
                   else:
                     creation_date = w.creation_date
                   
@@ -70,12 +82,20 @@ def get_domain_age(domain, use_whois=False):
                 for pre_tag in pre_tags:
                   whois_data = pre_tag.text.strip() #Get text content of <pre> tag
                   if 'Creation Date:' in whois_data:
-                    # My default path, when --whois is not passed, is this scrape of one website's page layout and one date shape. A registry whose record writes the date in ISO form, or a page that changes its markup, gives me nothing, and the failure reads exactly like a domain with no creation date.
-                    match = re.search(r"Creation Date:\s*([A-Za-z]{3}-\d{2}-\d{4})", whois_data) #Updated Regex
-                    if match:
-                        date_str = match.group(1)
-                        creation_date = datetime.datetime.strptime(date_str, "%b-%d-%Y").date()
-                        return creation_date
+                    # Accept the common registry date shapes: ISO dates
+                    # (2020-01-02, also the date part of an ISO datetime),
+                    # Mon-DD-YYYY, and DD-Mon-YYYY.
+                    for pattern, fmt in (
+                        (r"Creation Date:\s*(\d{4}-\d{2}-\d{2})", "%Y-%m-%d"),
+                        (r"Creation Date:\s*([A-Za-z]{3}-\d{2}-\d{4})", "%b-%d-%Y"),
+                        (r"Creation Date:\s*(\d{2}-[A-Za-z]{3}-\d{4})", "%d-%b-%Y"),
+                    ):
+                        match = re.search(pattern, whois_data)
+                        if match:
+                            try:
+                                return datetime.datetime.strptime(match.group(1), fmt).date()
+                            except ValueError:
+                                continue
             except requests.exceptions.RequestException as e:
                 logging.error(f"Error fetching WHOIS data for {domain}: {e}")
                 return None
@@ -89,12 +109,28 @@ def get_domain_age(domain, use_whois=False):
     return None
 
 
+# Common two-level public suffixes. This is a short built-in list, not
+# the full public suffix list, but it covers the suffixes most often
+# seen on mail and nameserver hosts.
+TWO_LEVEL_SUFFIXES = {
+    "ac.uk", "co.uk", "gov.uk", "org.uk",
+    "com.au", "net.au", "org.au", "co.nz",
+    "com.br", "com.cn", "com.tw", "co.jp", "ne.jp", "co.kr",
+    "co.in", "com.mx", "com.sg", "com.hk", "co.za",
+}
+
 def registered_domain(host):
-    """Return the registered domain (last two labels) of a host name."""
+    """Return the registered domain of a host name.
+
+    That is the last two labels, or the last three when the last two
+    form a known two-level public suffix such as co.uk, so the result
+    is the operator's domain rather than the suffix itself.
+    """
     host = host.rstrip(".")
     parts = host.split(".")
+    if len(parts) >= 3 and ".".join(parts[-2:]) in TWO_LEVEL_SUFFIXES:
+        return ".".join(parts[-3:])
     if len(parts) >= 2:
-        # Last two labels is a shortcut that breaks on public suffixes: a host under co.uk reduces to co.uk itself, and the age I then look up belongs to the suffix registry, not to the operator's domain.
         return ".".join(parts[-2:])
     return host
 
@@ -151,9 +187,24 @@ def validate_domain(domain):
     Returns:
         bool: True if the domain is valid, False otherwise.
     """
-    # A simple regex for basic domain validation.  More complete validation might be needed.
-    # This pattern also accepts names with leading dots, empty labels, and hyphens at the edges, while refusing single letter top level domains and internationalised names. It is a shape check against typos, not a statement that the domain exists.
-    if not re.match(r"^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", domain):
+    # Shape check against typos, not a statement that the domain
+    # exists: at least two labels, no empty labels (so no leading,
+    # trailing, or doubled dots), each label 1 to 63 letters, digits,
+    # or hyphens and not starting or ending with a hyphen, and a top
+    # level domain of at least two letters. Punycode labels (xn--)
+    # pass; raw non-ASCII names do not.
+    if not domain or len(domain) > 253:
+        logging.error(f"Invalid domain format: {domain}")
+        return False
+    labels = domain.split(".")
+    if len(labels) < 2:
+        logging.error(f"Invalid domain format: {domain}")
+        return False
+    for label in labels:
+        if not re.match(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$", label):
+            logging.error(f"Invalid domain format: {domain}")
+            return False
+    if not re.match(r"^[A-Za-z]{2,}$", labels[-1]):
         logging.error(f"Invalid domain format: {domain}")
         return False
     return True
@@ -179,6 +230,7 @@ def main():
         print(f"Could not determine age for domain: {domain}")
 
     if args.dns:
+        age_cache = {}
         records = get_associated_domains(domain)
         if any(records.values()):
             print("\nAssociated Domains (DNS):")
@@ -190,8 +242,12 @@ def main():
                         print(f"  - {value}")
                     else:
                         reg_domain = registered_domain(value)
-                        # There is no caching on this loop. Several MX or NS hosts usually share one registered domain, and I fetch its age again for each of them, which on the scraping path means repeated requests to the same page for the same answer.
-                        creation_date_assoc = get_domain_age(reg_domain, args.whois)
+                        # Cache per registered domain: several MX or NS
+                        # hosts usually share one, and its age is fetched
+                        # only once per run.
+                        if reg_domain not in age_cache:
+                            age_cache[reg_domain] = get_domain_age(reg_domain, args.whois)
+                        creation_date_assoc = age_cache[reg_domain]
                         if creation_date_assoc:
                           age_assoc = (datetime.date.today() - creation_date_assoc).days
                           print(f"  - {value} - Registered Domain: {reg_domain} - Creation Date: {creation_date_assoc}, Age: {age_assoc} days")
